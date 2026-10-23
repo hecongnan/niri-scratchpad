@@ -1,0 +1,8 @@
+// Mod follows your existing Niri mod-key.
+workspace "scratch"
+
+binds {
+    Mod+Shift+grave repeat=false hotkey-overlay-title="Scratchpad: 收起当前窗口" { spawn-sh "python3 \"${XDG_CONFIG_HOME:-$HOME/.config}/niri/scratchpad.py\" stash"; }
+    Mod+grave repeat=false hotkey-overlay-title="Scratchpad: 呼出／收起" { spawn-sh "python3 \"${XDG_CONFIG_HOME:-$HOME/.config}/niri/scratchpad.py\" toggle"; }
+    Mod+Ctrl+grave repeat=false hotkey-overlay-title="Scratchpad: 下一个窗口" { spawn-sh "python3 \"${XDG_CONFIG_HOME:-$HOME/.config}/niri/scratchpad.py\" next"; }
+}
