@@ -34,11 +34,11 @@ class Niri:
     def query(self, name):
         return self.request(name)[name]
 
-    def action(self, name, **arguments):
-        self.request({"Action": {name: arguments}})
+    def action(self, action_name, **arguments):
+        self.request({"Action": {action_name: arguments}})
 
 
-def manage(niri, state, command, workspace_name="scratch"):
+def manage(niri, state, command, workspace_name="scratch", all_workspaces=False):
     workspaces = niri.query("Workspaces")
     stash = next((w for w in workspaces if w["name"] == workspace_name), None)
     current = next((w for w in workspaces if w["is_focused"]), None)
@@ -67,10 +67,45 @@ def manage(niri, state, command, workspace_name="scratch"):
     focused = next((w for w in windows.values() if w["is_focused"]), None)
     # Recover windows from the workspace if runtime state was lost, and discard
     # closed windows. Window IDs and state are scoped to this compositor session.
-    order = [wid for wid in state.get("order", []) if wid in windows]
-    order.extend(wid for wid, w in windows.items()
-                 if w["workspace_id"] == stash["id"] and wid not in order)
-    state["order"] = order
+    members = [wid for wid in state.get("order", []) if wid in windows]
+    members.extend(wid for wid, w in windows.items()
+                 if w["workspace_id"] == stash["id"] and wid not in members)
+    state["order"] = members
+    origins = state.setdefault("return_workspaces", {})
+    pins = state.setdefault("workspace_pins", {})
+    for key in list(origins):
+        if key not in {str(wid) for wid in windows}:
+            del origins[key]
+
+    def cleanup_pins():
+        available = {w["id"]: w for w in niri.query("Workspaces")}
+        for key, name in list(pins.items()):
+            if any(origin["id"] == int(key) for origin in origins.values()):
+                continue
+            workspace = available.get(int(key))
+            # Never undo a name the user changed while the window was borrowed.
+            if workspace and workspace["name"] == name:
+                niri.action("UnsetWorkspaceName", reference={"Id": int(key)})
+            del pins[key]
+
+    cleanup_pins()
+    order = members
+    if all_workspaces and command in ("toggle", "next"):
+        # Only other workspaces and already borrowed members are candidates.
+        # Keep this separate from explicit scratchpad membership, so ordinary
+        # windows never become permanently stashed merely by being discovered.
+        candidates = set(members)
+        candidates.update(wid for wid, w in windows.items()
+                          if w["workspace_id"] is not None
+                          and (w["workspace_id"] != current["id"] or str(wid) in origins))
+        order = [wid for wid in state.get("auto_order", []) if wid in candidates]
+        order.extend(wid for wid in sorted(candidates) if wid not in order)
+        state["auto_order"] = order
+        visible = state.get("visible_window")
+        if (command == "toggle" and visible in order
+                and windows[visible]["workspace_id"] == current["id"]):
+            order.remove(visible)
+            order.append(visible)
     # Reset legacy arbitrary slot bounds once; retain membership and backups.
     if state.get("slot_policy") != "original-window-954x1028-v1":
         state.pop("slot", None)
@@ -129,13 +164,25 @@ def manage(niri, state, command, workspace_name="scratch"):
         niri.action("MoveWindowToWorkspace", window_id=wid,
                     reference={"Id": workspace_id}, focus=False)
 
-    def hide(window):
+    def hide(window, keep_in_stash=False):
         nonlocal current
         key = str(window["id"])
         bounds = geometry(window)
         if key in modes and bounds and not state.get("center_slot"):
             state["slot"] = {"output": current.get("output"), "bounds": bounds}
-        move(window["id"], stash["id"])
+        origin = origins.get(key)
+        destination = stash["id"]
+        if origin and not keep_in_stash:
+            available = niri.query("Workspaces")
+            if any(w["id"] == origin["id"] for w in available):
+                destination = origin["id"]
+            else:
+                # Output removal or an explicit workspace deletion may still
+                # invalidate a pinned workspace. Keep the window recoverable.
+                if window["id"] not in members:
+                    members.append(window["id"])
+                print("niri-scratchpad: 原工作区已不存在，窗口已收回 scratch", file=sys.stderr)
+        move(window["id"], destination)
         # Restore geometry in the hidden floating layout, even if the user
         # manually toggled the shown member back to tiling before hiding it.
         is_floating = window.get("is_floating", False)
@@ -156,6 +203,13 @@ def manage(niri, state, command, workspace_name="scratch"):
                 niri.action("MoveWindowToFloating" if original_floating else "MoveWindowToTiling",
                             id=window["id"])
             del modes[key]
+        if origin and not origin.get("floating", False) and origin.get("size"):
+            # Restore the original tiling dimensions after restoring its mode.
+            width, height = origin["size"]
+            niri.action("SetWindowWidth", id=window["id"], change={"SetFixed": width})
+            niri.action("SetWindowHeight", id=window["id"], change={"SetFixed": height})
+        origins.pop(key, None)
+        cleanup_pins()
         # Niri can remove an emptied unnamed workspace and focus scratch.
         # Keep the user on an ordinary workspace, including before cycling.
         available = niri.query("Workspaces")
@@ -181,22 +235,26 @@ def manage(niri, state, command, workspace_name="scratch"):
 
     if command == "stash":
         if focused is not None:
-            hide(focused)
+            hide(focused, keep_in_stash=True)
             if focused["id"] in order:
                 order.remove(focused["id"])
             order.append(focused["id"])
         return
 
-    if not order:
-        return
     if command == "release":
-        if focused and focused["id"] in order:
-            order.remove(focused["id"])
+        if focused and (focused["id"] in order or str(focused["id"]) in origins):
+            if focused["id"] in order:
+                order.remove(focused["id"])
             modes.pop(str(focused["id"]), None)
             geometries.pop(str(focused["id"]), None)
+            origins.pop(str(focused["id"]), None)
+            cleanup_pins()
             if state.get("visible_window") == focused["id"]:
                 state.pop("visible_window", None)
             state.pop("return_window", None)
+        return
+
+    if not order:
         return
 
     # Cycling replaces the visible member even if keyboard focus was lost.
@@ -221,6 +279,23 @@ def manage(niri, state, command, workspace_name="scratch"):
     target_window = next((w for w in live if w["id"] == target), None)
     if target_window is None:
         return
+    if all_workspaces and target not in members and str(target) not in origins:
+        origin = next((w for w in niri.query("Workspaces")
+                       if w["id"] == target_window["workspace_id"]), None)
+        if origin is None or origin["id"] == current["id"]:
+            return
+        origins[str(target)] = {"id": origin["id"],
+                                "floating": target_window.get("is_floating", False),
+                                "size": target_window.get("layout", {}).get("window_size")}
+        # Empty unnamed workspaces disappear in Niri. Temporarily name only
+        # the borrowed window's source, then unname it once it is returned.
+        if origin["name"] is None:
+            name = f"scratchpad-return-{origin['id']}-{target}"
+            names = {w["name"] for w in niri.query("Workspaces")}
+            while name in names:
+                name += "-"
+            pins[str(origin["id"])] = name
+            niri.action("SetWorkspaceName", name=name, workspace={"Id": origin["id"]})
     # Floating is temporary: remember the mode before the first summon, and
     # convert while still hidden so the destination's tiling stays untouched.
     modes.setdefault(str(target), target_window.get("is_floating", False))
@@ -258,6 +333,8 @@ def manage(niri, state, command, workspace_name="scratch"):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command", choices=("stash", "toggle", "next", "release"))
+    parser.add_argument("--all-workspaces", action="store_true",
+                        help="自动呼出并循环其他工作区的窗口，收起时送回原工作区")
     args = parser.parse_args()
     path = os.environ.get("NIRI_SOCKET")
     runtime = os.environ.get("XDG_RUNTIME_DIR")
@@ -277,7 +354,7 @@ def main():
         except json.JSONDecodeError:
             state = {}
         try:
-            manage(Niri(path), state, args.command)
+            manage(Niri(path), state, args.command, all_workspaces=args.all_workspaces)
         finally:
             # Keep membership after a partial IPC failure so another invocation
             # can recover; hidden windows also remain accessible in Overview.
