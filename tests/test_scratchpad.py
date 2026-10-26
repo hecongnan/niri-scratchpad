@@ -30,6 +30,11 @@ class Desktop:
             1: {"id": 1, "workspace_id": 10, "app_id": "browser", "is_focused": False, "is_floating": False},
             2: {"id": 2, "workspace_id": 10, "app_id": None, "is_focused": True, "is_floating": False},
         }
+        # Real IPC includes layout even for tiled windows. Keep the fixture
+        # realistic so resize confirmation is exercised in ordinary workflows.
+        for window in self.windows.values():
+            window["layout"] = {"window_size": [640, 480],
+                                "tile_pos_in_workspace_view": [100.0, 100.0]}
         self.actions = []
 
     def query(self, name):
@@ -210,6 +215,65 @@ class ScratchpadTests(unittest.TestCase):
         self.assertEqual(self.desktop.actions, [("FocusWindow", {"id": 2})])
         self.run_command("toggle")
         self.assertTrue(self.desktop.windows[1]["is_focused"])
+
+    def test_refocus_manually_retiled_member_only_focuses(self):
+        self.run_command("stash")
+        self.run_command("toggle")
+        backups = copy.deepcopy((self.state["restore_modes"], self.state["restore_geometry"]))
+        self.desktop.action("MoveWindowToTiling", id=2)
+        self.desktop.focus(1)
+        background = copy.deepcopy(self.desktop.windows[1])
+        self.desktop.actions.clear()
+        self.run_command("toggle")
+        self.assertEqual(self.desktop.actions, [("FocusWindow", {"id": 2})])
+        self.assertFalse(self.desktop.windows[2]["is_floating"])
+        self.assertEqual(self.desktop.windows[1]["layout"], background["layout"])
+        self.assertEqual((self.state["restore_modes"], self.state["restore_geometry"]), backups)
+
+    def test_delayed_resize_stays_pending_and_refocus_retries(self):
+        self.desktop.windows[2]["is_floating"] = True
+        self.desktop.windows[2]["layout"] = {
+            "window_size": [1912, 1028], "tile_pos_in_workspace_view": [4.0, 48.0]
+        }
+        original_action = self.desktop.action
+        pending = {}
+        def defer_resize(name, **arguments):
+            if name in ("SetWindowWidth", "SetWindowHeight"):
+                self.desktop.actions.append((name, arguments))
+                axis = 0 if name == "SetWindowWidth" else 1
+                pending[(arguments["id"], axis)] = arguments["change"]["SetFixed"]
+            else:
+                original_action(name, **arguments)
+        self.desktop.action = defer_resize
+        clock = [0.0]
+        def advance(seconds):
+            clock[0] += seconds
+        with patch.object(scratchpad.time, "monotonic", side_effect=lambda: clock[0]), patch.object(
+            scratchpad.time, "sleep", side_effect=advance
+        ):
+            self.run_command("stash")
+            self.desktop.actions.clear()
+            self.run_command("toggle")
+            self.assertTrue(self.state.get("center_slot"))
+            self.assertNotIn("slot", self.state)
+            self.assertFalse(any(name == "CenterWindow" for name, _ in self.desktop.actions))
+            # The client commits its new size after the invocation timed out.
+            for (wid, axis), value in pending.items():
+                self.desktop.windows[wid]["layout"]["window_size"][axis] = value
+            self.desktop.focus(1)
+            self.run_command("toggle")
+        self.assertNotIn("center_slot", self.state)
+        self.assertEqual(self.state["slot"]["bounds"]["width"], 954)
+        self.assertEqual(self.desktop.windows[2]["layout"]["tile_pos_in_workspace_view"], [483.0, 26.0])
+
+    def test_pending_initialization_does_not_adopt_previous_slot(self):
+        self.run_command("stash")
+        self.state["center_slot"] = True
+        self.state["slot"] = {"output": "A", "bounds": {"x": 4, "y": 48, "width": 1912, "height": 1028}}
+        self.run_command("toggle")
+        self.assertEqual(self.desktop.windows[2]["layout"]["window_size"], [954, 1028])
+        self.assertEqual(self.state["slot"]["bounds"]["width"], 954)
+        self.assertNotIn("center_slot", self.state)
 
     def test_cycling_single_window_uses_its_position_after_hiding(self):
         self.run_command("stash")
