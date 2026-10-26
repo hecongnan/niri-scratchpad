@@ -48,6 +48,61 @@ class AutomaticWorkspaceTests(unittest.TestCase):
     def run_command(self, command):
         scratchpad.manage(self.desktop, self.state, command, all_workspaces=True)
 
+    def start_in_scratch_with_local_terminal(self):
+        self.desktop.windows[6] = {
+            "id": 6, "workspace_id": 20, "is_focused": False,
+            "is_floating": False, "app_id": "terminal",
+            "layout": {"window_size": [640, 480], "tile_pos_in_workspace_view": [100.0, 100.0]},
+        }
+        self.desktop.focus(6)
+        self.state["order"] = [6]
+        return copy.deepcopy(self.desktop.windows[6])
+
+    def test_invoking_in_scratch_borrows_into_same_workspace(self):
+        background = self.start_in_scratch_with_local_terminal()
+        self.run_command("toggle")
+        self.assertEqual(self.desktop.windows[3]["workspace_id"], 20)
+        self.assertTrue(self.desktop.windows[3]["is_floating"])
+        self.assertTrue(self.desktop.workspaces[1]["is_focused"])
+        self.assertEqual(self.desktop.windows[6]["workspace_id"], background["workspace_id"])
+        self.assertEqual(self.desktop.windows[6]["is_floating"], background["is_floating"])
+        self.assertEqual(self.desktop.windows[6]["layout"], background["layout"])
+        self.assertNotIn(6, self.state["auto_order"])
+        self.assertFalse(any(name == "FocusWorkspace" for name, _ in self.desktop.actions))
+
+    def test_hiding_in_scratch_returns_remote_and_restores_local_focus(self):
+        background = self.start_in_scratch_with_local_terminal()
+        self.run_command("toggle")
+        self.run_command("toggle")
+        self.assertEqual(self.desktop.windows[3]["workspace_id"], 30)
+        self.assertTrue(self.desktop.workspaces[1]["is_focused"])
+        self.assertEqual(self.desktop.windows[6], background)
+        self.assertFalse(any(name == "FocusWorkspace" for name, _ in self.desktop.actions))
+
+    def test_single_borrowed_member_in_scratch_is_not_claimed_as_manual(self):
+        self.start_in_scratch_with_local_terminal()
+        self.desktop.windows.pop(1)
+        self.desktop.windows.pop(2)
+        self.run_command("toggle")
+        self.run_command("next")
+        self.assertIn("3", self.state["return_workspaces"])
+        self.assertNotIn(3, self.state["order"])
+        self.run_command("toggle")
+        self.assertEqual(self.desktop.windows[3]["workspace_id"], 30)
+        self.assertEqual(self.state["order"], [6])
+
+    def test_cycling_in_scratch_never_borrows_its_local_terminal(self):
+        background = self.start_in_scratch_with_local_terminal()
+        self.add_remote(4)
+        self.run_command("toggle")
+        for _ in range(4):
+            self.run_command("next")
+            self.assertNotEqual(self.state["visible_window"], 6)
+            self.assertEqual(self.desktop.windows[self.state["visible_window"]]["workspace_id"], 20)
+            self.assertTrue(self.desktop.workspaces[1]["is_focused"])
+        self.assertEqual(self.desktop.windows[6]["layout"], background["layout"])
+        self.assertFalse(self.desktop.windows[6]["is_floating"])
+
     def test_cycles_all_other_workspace_windows_without_manual_stash(self):
         self.add_remote(4)
         self.add_remote(5)

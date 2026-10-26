@@ -52,7 +52,9 @@ def manage(niri, state, command, workspace_name="scratch", all_workspaces=False)
                     next((w for w in ordinary if w.get("output") == current.get("output")),
                          next(iter(ordinary), None)))
 
-    recovering = current["id"] == stash["id"]
+    # Automatic borrowing can use scratch as its destination too. Its local
+    # windows are background, so do not redirect the invocation elsewhere.
+    recovering = current["id"] == stash["id"] and not all_workspaces
     if recovering:
         if command not in ("toggle", "next"):
             return
@@ -69,7 +71,8 @@ def manage(niri, state, command, workspace_name="scratch", all_workspaces=False)
     # closed windows. Window IDs and state are scoped to this compositor session.
     members = [wid for wid in state.get("order", []) if wid in windows]
     members.extend(wid for wid, w in windows.items()
-                 if w["workspace_id"] == stash["id"] and wid not in members)
+                 if w["workspace_id"] == stash["id"] and wid not in members
+                 and str(wid) not in state.get("return_workspaces", {}))
     state["order"] = members
     origins = state.setdefault("return_workspaces", {})
     pins = state.setdefault("workspace_pins", {})
@@ -94,7 +97,9 @@ def manage(niri, state, command, workspace_name="scratch", all_workspaces=False)
         # Only other workspaces and already borrowed members are candidates.
         # Keep this separate from explicit scratchpad membership, so ordinary
         # windows never become permanently stashed merely by being discovered.
-        candidates = set(members)
+        candidates = {wid for wid in members
+                      if windows[wid]["workspace_id"] != current["id"]
+                      or str(wid) in origins or str(wid) in state.get("restore_modes", {})}
         candidates.update(wid for wid, w in windows.items()
                           if w["workspace_id"] is not None
                           and (w["workspace_id"] != current["id"] or str(wid) in origins))
@@ -218,7 +223,8 @@ def manage(niri, state, command, workspace_name="scratch", all_workspaces=False)
         # Keep the user on an ordinary workspace, including before cycling.
         available = niri.query("Workspaces")
         active = next((w for w in available if w["is_focused"]), None)
-        if active and active["id"] == stash["id"]:
+        if (active and active["id"] == stash["id"]
+                and not (all_workspaces and current["id"] == stash["id"])):
             active = ordinary_workspace(available)
             if active:
                 niri.action("FocusWorkspace", reference={"Id": active["id"]})
